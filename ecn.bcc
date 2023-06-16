@@ -1,0 +1,60 @@
+#include <net/inet_sock.h>
+#include <uapi/linux/ip.h>
+
+BPF_ARRAY(ecn_stats, u64, 3);
+
+#define MAC_HEADER_SIZE 14
+#define member_address(source_struct, source_member)                           \
+  ((void *)(((char *)source_struct) +                                          \
+            offsetof(typeof(*source_struct), source_member)))
+
+#define member_read(destination, source_struct, source_member)                 \
+  do {                                                                         \
+    bpf_probe_read(destination, sizeof(source_struct->source_member),          \
+                   member_address(source_struct, source_member));              \
+  } while (0)
+
+static inline int do_trace_skb(void *ctx, struct sk_buff *skb) {
+  char *head;
+  u16 mac_header;
+  u16 network_header;
+  u8 ip_version;
+
+  member_read(&head, skb, head);
+  member_read(&mac_header, skb, mac_header);
+  member_read(&network_header, skb, network_header);
+
+  if (network_header == 0) {
+    network_header = mac_header + MAC_HEADER_SIZE;
+  }
+
+  char *ip_header_address = head + network_header;
+
+  bpf_probe_read(&ip_version, sizeof(u8), ip_header_address);
+  ip_version = ip_version >> 4 & 0xf;
+
+  if (ip_version == 4) {
+    struct iphdr iphdr;
+    bpf_probe_read(&iphdr, sizeof(iphdr), ip_header_address);
+    u8 tos;
+    tos = iphdr.tos & 0x3;
+    u64 *val = NULL;
+    int key = 0;
+    if (tos != 0) {
+      key = 1;
+			if (tos == 0x3) {
+				key = 2;
+			}
+    }
+    val = ecn_stats.lookup(&key);
+    if (val != NULL) {
+      lock_xadd(val, 1);
+      ecn_stats.update(&key, val);
+    }
+  }
+  return 0;
+}
+
+TRACEPOINT_PROBE(net, net_dev_xmit) {
+  return do_trace_skb(args, (struct sk_buff *)args->skbaddr);
+}
